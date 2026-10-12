@@ -63,7 +63,7 @@ int main() {
 
     int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE; 
 
-    printf("Benchmarking CPU implementation");
+    printf("Benchmarking CPU implementation...\n");
     double cpu_total_time = 0.0;
     for (int i = 0; i < 20; i++) {
         double start_time = get_time();
@@ -73,7 +73,7 @@ int main() {
     }
     double cpu_avg_time = cpu_total_time / 20.0;
 
-    printf("Benchmarking GPU implementation");
+    printf("Benchmarking GPU implementation...\n");
     double gpu_total_time = 0.0;
     for (int i = 0; i < 20; i++) {
         double start_time = get_time();
