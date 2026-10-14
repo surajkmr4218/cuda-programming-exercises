@@ -1,0 +1,12 @@
+# Ignore everything in the repository
+*
+
+# Do not ignore directories, so Git can search inside them for files
+!*/
+
+# Allow only .cu and .cuh files
+!*.cu
+!*.cuh
+
+# Allow the .gitignore file itself to be tracked
+!.gitignore
