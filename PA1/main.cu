@@ -4,42 +4,19 @@
 #include <time.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "kernels.cuh"
 
-#define N  512            // A, B, C are N x N
-#define P  32             // p x p total threads
-#define BD 8              // threads per block side 
-#define T  (N / P)        // each thread computes a T x T tile of C
-#define BS (BD * T)       // rows/cols of C covered by one block
-#define KC 32             // chunk of the shared dimension staged in shared memory (Naive-2)
+#define MAX_THREAD_WORK 2e9
 
 // CPU Reference (for myself to look back on)
 void matmul_cpu(__half *A, __half *B, float *C, int n) {
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             float sum = 0.0f;
-            for (int k = 0; k < n; k++){
+            for (int k = 0; k < n; k++) {
                 sum += __half2float(A[i * n + k]) * __half2float(B[k * n + j]);
             }
             C[i * n + j] = sum;
-        }
-    }
-}
-
-// Naive-1: p x p threads, each owns a T x T tile of C, global memory only
-__global__ void naive_1(const __half *A, const __half *B, float *C) {
-    int gx = blockIdx.x * blockDim.x + threadIdx.x;   // tile column index
-    int gy = blockIdx.y * blockDim.y + threadIdx.y;   // tile row index
-
-    for (int i = 0; i < T; i++) {
-        for (int j = 0; j < T; j++) {
-            int row = gy * T + i;
-            int col = gx * T + j;
-
-            float sum = 0.0f;
-            for (int k = 0; k < N; k++) {
-                sum += __half2float(A[row * N + k]) * __half2float(B[k * N + col]);
-            }
-            C[row * N + col] = sum;
         }
     }
 }
@@ -56,48 +33,122 @@ double get_time() {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// GPU timing with CUDA events: tic() before a launch, toc() after it returns ms
+cudaEvent_t evStart, evStop;
+void tic() { 
+    cudaEventRecord(evStart); 
+}
+float toc() {
+    cudaEventRecord(evStop);
+    cudaEventSynchronize(evStop);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("  CUDA error: %s\n", cudaGetErrorString(err));
+        return -1.0f;
+    }
+    float ms;
+    cudaEventElapsedTime(&ms, evStart, evStop);
+    return ms;
+}
+
 int main() {
-    size_t size_h = (size_t)N * N * sizeof(__half);
-    size_t size_f = (size_t)N * N * sizeof(float);
+    int Ns[] = {64, 128, 512, 1024, 4096, 16384};
+    int Ps[] = {1, 16, 32, 64};
+    int numN = sizeof(Ns) / sizeof(Ns[0]);
+    int numP = sizeof(Ps) / sizeof(Ps[0]);
 
-    __half *h_A = (__half *)malloc(size_h);
-    __half *h_B = (__half *)malloc(size_h);
-    float *h_C_cpu = (float *)malloc(size_f);
-    float *h_C_gpu = (float *)malloc(size_f);
+    cudaEventCreate(&evStart);
+    cudaEventCreate(&evStop);
 
-    srand(42);
-    init_matrix(h_A, N);
-    init_matrix(h_B, N);
+    // Let naive2 use the device's max (opt-in) shared memory per block 
+    int maxSmem;
+    cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    cudaFuncSetAttribute(naive2, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSmem);
 
-    __half *d_A, *d_B;
-    float  *d_C;
-    cudaMalloc(&d_A, size_h);
-    cudaMalloc(&d_B, size_h);
-    cudaMalloc(&d_C, size_f);
-    cudaMemcpy(d_A, h_A, size_h, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size_h, cudaMemcpyHostToDevice);
+    for (int ni = 0; ni < numN; ni++) {
+        int N = Ns[ni];
+        size_t bytesH = (size_t)N * N * sizeof(__half);
+        size_t bytesF = (size_t)N * N * sizeof(float);
 
-    dim3 blockDim(BD, BD);
-    dim3 gridDim(P / BD, P / BD);
-    printf("N=%d P=%d T=%d | blockNum=%d threadNum=%d\n",
-           N, P, T, (P / BD) * (P / BD), BD * BD);
+        // Host matrices (random), copied to device
+        __half *hA = (__half *)malloc(bytesH);
+        __half *hB = (__half *)malloc(bytesH);
+        init_matrix(hA, N);
+        init_matrix(hB, N);
 
-    // matmul_cpu(h_A, h_B, h_C_cpu, N);
+        __half *dA, *dB;
+        float *dC;
+        cudaMalloc(&dA, bytesH);
+        cudaMalloc(&dB, bytesH);
+        cudaMalloc(&dC, bytesF);
+        cudaMemcpy(dA, hA, bytesH, cudaMemcpyHostToDevice);
+        cudaMemcpy(dB, hB, bytesH, cudaMemcpyHostToDevice);
 
-    // ---------- Naive-1 ----------
-    printf("Benchmarking Naive-1...\n");
-    for (int i = 0; i < 3; i++) {                       // warm-up
-        naive_1<<<gridDim, blockDim>>>(d_A, d_B, d_C);
-        cudaDeviceSynchronize();
+        // Warm-up once: the first launch of each kernel includes module-load overhead
+        if (ni == 0) {
+            naive1<<<1, 1>>>(dA, dB, dC, N, N);
+            naive2<<<1, 1, 2 * N * sizeof(__half)>>>(dA, dB, dC, N, N, N);
+            blockMM<<<dim3(1, 1), dim3(1, 1)>>>(dA, dB, dC, N, 1);
+            cudaDeviceSynchronize();
+        }
+
+        for (int pi = 0; pi < numP; pi++) {
+            int p = Ps[pi];
+            int total = p * p;   // total threads for Naive-1/2
+            bool tooSlow = (double)N * N * N / total > MAX_THREAD_WORK;
+
+            // ---- Naive-1 and Naive-2: blockNum * threadNum = p*p ----
+            // threadNum = 1, 2, 4, ... up to min(p*p, 1024)
+            for (int tn = 1; tn <= total && tn <= 1024; tn *= 2) {
+                int bn = total / tn;
+
+                if (tooSlow) {
+                    printf("naive1,%d,%d,%d,%d,skipped\n", N, p, bn, tn);
+                    printf("naive2,%d,%d,%d,%d,skipped\n", N, p, bn, tn);
+                    continue;
+                }
+
+                // Naive-1
+                tic();
+                naive1<<<bn, tn>>>(dA, dB, dC, N, p);
+                printf("naive1,%d,%d,%d,%d,%.3f\n", N, p, bn, tn, toc());
+
+                // Naive-2: pick the largest kc (power of 2) whose slice fits in shared memory
+                int T = N / p;
+                int rows = (tn >= p ? tn / p : 1) * T;
+                int cols = (tn >= p ? p : tn) * T;
+                int kc = N;
+                while (kc > 1 && (size_t)(rows + cols) * kc * sizeof(__half) > (size_t)maxSmem)
+                    kc /= 2;
+                size_t smem = (size_t)(rows + cols) * kc * sizeof(__half);
+                if (smem > (size_t)maxSmem) {
+                    printf("naive2,%d,%d,%d,%d,skipped\n", N, p, bn, tn);
+                    continue;
+                }
+                tic();
+                naive2<<<bn, tn, smem>>>(dA, dB, dC, N, p, kc);
+                printf("naive2,%d,%d,%d,%d,%.3f\n", N, p, bn, tn, toc());
+            }
+
+            // ---- Block MM: fixed layout, (N/p)^2 blocks of p x p threads ----
+            // p x p threads per block must be <= 1024, so p = 64 is not possible
+            if (p <= 32) {
+                tic();
+                blockMM<<<dim3(N / p, N / p), dim3(p, p)>>>(dA, dB, dC, N, p);
+                printf("blockMM,%d,%d,%d,%d,%.3f\n", N, p, (N / p) * (N / p), p * p, toc());
+            } else {
+                printf("blockMM,%d,%d,-,-,skipped (p*p > 1024)\n", N, p);
+            }
+        }
+
+        cudaFree(dA);
+        cudaFree(dB);
+        cudaFree(dC);
+        free(hA);
+        free(hB);
     }
-    double total1 = 0.0;
-    for (int i = 0; i < 20; i++) {
-        double start_time = get_time();
-        naive_1<<<gridDim, blockDim>>>(d_A, d_B, d_C);
-        cudaDeviceSynchronize();
-        double end_time = get_time();
-        total1 += end_time - start_time;
-    }
-    cudaMemcpy(h_C_gpu, d_C, size_f, cudaMemcpyDeviceToHost);
-    printf("Naive-1 average time: %f microseconds\n", total1 / 20.0 * 1e6);
+
+    cudaEventDestroy(evStart);
+    cudaEventDestroy(evStop);
+    return 0;
 }
