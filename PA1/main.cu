@@ -40,6 +40,8 @@ size_t naive2_smem(int N, int p, int tn) {
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered to see progress live in the Slurm log
+
     int Ns[] = {64, 128, 512, 1024, 4096, 16384};
     int Ps[] = {1, 16, 32, 64};
     int numN = sizeof(Ns) / sizeof(Ns[0]);
@@ -97,6 +99,11 @@ int main() {
             int p  = configs[c][0];
             int bn = configs[c][1];
             int tn = configs[c][2];
+
+            if ((double)N * N * N / (p * p) > 2e9) {
+                printf("naive1/naive2, N=%d, p=%d, bn=%d, tn=%d, skipped (too slow)\n", N, p, bn, tn);
+                continue;
+            }
 
             // Naive-1: no shared memory, runs for every config
             tic();

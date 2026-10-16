@@ -2,7 +2,7 @@
 #SBATCH -A csdsx75
 #SBATCH -p markov_gpu
 #SBATCH --gres=gpu:1
-#SBATCH -o output.o
+#SBATCH -o output_log.o
 #SBATCH --time=02:00:00
 #SBATCH --mem=8G
 
