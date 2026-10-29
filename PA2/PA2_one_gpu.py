@@ -10,10 +10,6 @@ training_data = datasets.CIFAR10(
     root="data", train=True, download=True, transform=transforms.ToTensor()
 )
 
-# Create a DataLoader for batching and shuffling
-training_loader = DataLoader(training_data, batch_size=64, shuffle=True, num_workers=4)
-
-
 # The cnn model class is now a LightningModule instead of nn.Module.
 class EX_CNN(pl.LightningModule):
     """
@@ -82,12 +78,25 @@ class EX_CNN(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    # Instantiate your model.
-    Ex_Net = EX_CNN()
-    print(Ex_Net)
+    import time
 
-    # Train on 1 GPU for 10 epochs. Lightning handles device placement and the loop.
-    trainer = pl.Trainer(accelerator="gpu", devices=1, max_epochs=10, log_every_n_steps=20)
-    trainer.fit(Ex_Net, train_dataloaders=training_loader)
+    results = {}
+    for bs in [32, 64, 128, 256]:
+        # New loader and fresh model for each batch size
+        loader = DataLoader(training_data, batch_size=bs, shuffle=True)
+        Ex_Net = EX_CNN()
+
+        # Train on 1 GPU for 2 epochs
+        trainer = pl.Trainer(accelerator="gpu", devices=1, max_epochs=2,
+                             log_every_n_steps=20, enable_checkpointing=False)
+
+        start = time.time()
+        trainer.fit(Ex_Net, train_dataloaders=loader)
+        results[bs] = time.time() - start
+        print(f"Batch size {bs}: {results[bs]:.1f}s")
+
+    print("\nSummary (2 epochs, 1 GPU):")
+    for bs, t in results.items():
+        print(f"  bs={bs:4d}: {t:.1f}s")
 
     print("Finished training.")
